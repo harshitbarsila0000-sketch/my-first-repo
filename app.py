@@ -9,7 +9,6 @@ No real steganographic encoding or working exfiltration mechanism is present.
 See README for full disclosure.
 """
 
-import hashlib
 import random
 import string
 import os
@@ -17,7 +16,15 @@ import os
 import streamlit as st
 from groq import Groq
 
-from sif_engine import compute_srs, sif_sanitize
+from sif_engine import (
+    compute_srs,
+    create_secure_artifact,
+    decode_secure_artifact,
+    get_shared_secret,
+    parse_artifact,
+    serialize_artifact,
+    sif_sanitize,
+)
 
 st.set_page_config(
     page_title="R&AW | Operation Silent Web",
@@ -273,8 +280,9 @@ _DEFAULTS = {
     "payload": "",
     "generated_text": "",
     "fingerprint": "",
+    "secure_artifact": "",
     "network_text": "",
-    "network_fingerprint_valid": False,
+    "network_artifact": "",
     "last_srs": None,
     "sif_enabled": True,          # ← SIF master switch persisted here
 }
@@ -286,6 +294,7 @@ for _k, _v in _DEFAULTS.items():
 # API Client
 # ─────────────────────────────────────────────────────────────────────────────
 _API_KEY = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+_SHARED_SECRET = get_shared_secret(st.secrets)
 client   = Groq(api_key=_API_KEY) if _API_KEY else None
 
 
@@ -375,8 +384,8 @@ with st.sidebar:
 
     # ── Session fingerprint status ────────────────────────────────────────
     if st.session_state.fingerprint:
-        fp_color = "#00ff55" if st.session_state.network_fingerprint_valid else "#ff4444"
-        fp_status = "INTACT" if st.session_state.network_fingerprint_valid else "COMPROMISED"
+        fp_color = "#00ff55" if st.session_state.network_artifact else "#b8860b"
+        fp_status = "HMAC READY" if st.session_state.network_artifact else "PENDING BROADCAST"
         st.markdown(
             f'<div style="font-family:\'Share Tech Mono\',monospace; font-size:0.72rem;">'
             f'<div style="color:#445544; letter-spacing:0.08rem;">SESSION FINGERPRINT</div>'
@@ -427,14 +436,14 @@ with tab1:
     st.markdown(
         '<div class="raw-panel-title">'
         '▸ FIELD OPERATIVE TERMINAL'
-        '<span class="doc-id">MODULE-01 // ENCODER // SHA-256 SESSION LINKING</span>'
+        '<span class="doc-id">MODULE-01 // ENCODER // AES-GCM + HMAC LINKING</span>'
         '</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
         '<div style="color:#334433; font-size:0.75rem; margin-bottom:0.8rem;">'
         'FUNCTION: Encode a test payload into a benign public-review cover text. '
-        'The payload is linked via a cryptographic session fingerprint '
+        'The payload and cover text are encrypted, then linked via an HMAC session fingerprint '
         '(metadata simulation — not token-level steganographic encoding).'
         '</div>',
         unsafe_allow_html=True,
@@ -474,13 +483,20 @@ with tab1:
                     generated = ""
 
             if generated:
-                fp = hashlib.sha256((payload_input + generated).encode()).hexdigest()[:16]
-                st.session_state.payload               = payload_input
-                st.session_state.generated_text        = generated
-                st.session_state.fingerprint           = fp
-                st.session_state.network_fingerprint_valid = True
-                st.session_state.last_srs              = None   # clear old SRS on new vector
-                st.session_state.network_text          = ""
+                if not _SHARED_SECRET:
+                    st.markdown(
+                        '<div class="alert-red">⚠ SIF_SHARED_SECRET NOT CONFIGURED — Cannot create encrypted artifact.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    artifact = create_secure_artifact(payload_input, generated, _SHARED_SECRET)
+                    st.session_state.payload          = payload_input
+                    st.session_state.generated_text   = generated
+                    st.session_state.fingerprint      = artifact["fingerprint"]
+                    st.session_state.secure_artifact  = serialize_artifact(artifact)
+                    st.session_state.last_srs         = None   # clear old SRS on new vector
+                    st.session_state.network_text     = ""
+                    st.session_state.network_artifact = ""
 
     if st.session_state.generated_text:
         st.markdown(
@@ -494,8 +510,8 @@ with tab1:
         )
         st.markdown(
             f'<div style="color:#334433; font-size:0.74rem; font-family:\'Share Tech Mono\',monospace;">'
-            f'SESSION FINGERPRINT: <span style="color:#b8860b;">{st.session_state.fingerprint}</span>'
-            f' &nbsp;|&nbsp; STATUS: <span style="color:#00ff55;">ACTIVE</span>'
+            f'HMAC FINGERPRINT: <span style="color:#b8860b;">{st.session_state.fingerprint[:16]}…</span>'
+            f' &nbsp;|&nbsp; STATUS: <span style="color:#00ff55;">ENCRYPTED</span>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -547,8 +563,7 @@ with tab2:
         if not incoming.strip():
             st.markdown('<div class="alert-amber">⚠ No transmission to broadcast.</div>', unsafe_allow_html=True)
         else:
-            final_text         = incoming
-            fingerprint_survives = True
+            final_text = incoming
 
             if st.session_state.sif_enabled:
                 # ── SIF is ON: score, then conditionally sanitise ──────
@@ -560,20 +575,18 @@ with tab2:
                     if client:
                         with st.spinner("[ SIF: SANITISING TRANSMISSION ... ]"):
                             final_text = sif_sanitize(incoming, client)
-                        fingerprint_survives = False
                     else:
                         st.markdown(
                             '<div class="alert-amber">⚠ SIF TRIGGERED but no API key — '
                             'scoring only, active sanitisation skipped.</div>',
                             unsafe_allow_html=True,
                         )
-                        fingerprint_survives = False   # treat as compromised
             else:
                 # ── SIF is OFF: bypass, wipe any old SRS result ────────
                 st.session_state.last_srs = None
 
-            st.session_state.network_text              = final_text
-            st.session_state.network_fingerprint_valid = fingerprint_survives
+            st.session_state.network_text     = final_text
+            st.session_state.network_artifact = st.session_state.secure_artifact
 
     # ── SIF Report ────────────────────────────────────────────────────────
     if st.session_state.last_srs and st.session_state.sif_enabled:
@@ -629,14 +642,14 @@ with tab2:
         if srs.triggered:
             st.markdown(
                 '<div class="alert-red" style="margin-top:0.6rem;">'
-                '⬛ THRESHOLD EXCEEDED — SIF ACTIVE SANITISATION DEPLOYED — FINGERPRINT DESTROYED'
+                '⬛ THRESHOLD EXCEEDED — SIF ACTIVE SANITISATION DEPLOYED — VISIBLE COVER TEXT SANITISED'
                 '</div>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
                 '<div class="alert-green" style="margin-top:0.6rem;">'
-                '⬜ BELOW THRESHOLD — TRANSMISSION CLEARED — FINGERPRINT INTACT'
+                '⬜ BELOW THRESHOLD — TRANSMISSION CLEARED — ARTIFACT READY FOR HMAC VERIFICATION'
                 '</div>',
                 unsafe_allow_html=True,
             )
@@ -655,9 +668,14 @@ with tab2:
             unsafe_allow_html=True,
         )
         st.text_area(
-            "BROADCAST TEXT  (copy to Module 3 — HQ Decoder):",
+            "BROADCAST COVER TEXT  (SIF-visible public text):",
             value=st.session_state.network_text,
             height=110,
+        )
+        st.text_area(
+            "ENCRYPTED ARTIFACT  (copy to Module 3 — HQ Decoder):",
+            value=st.session_state.network_artifact,
+            height=190,
         )
 
     st.markdown('</div>', unsafe_allow_html=True)
@@ -677,17 +695,17 @@ with tab3:
     )
     st.markdown(
         '<div style="color:#334433; font-size:0.75rem; margin-bottom:0.8rem;">'
-        'FUNCTION: Paste intercepted broadcast text. Decoder verifies the '
-        'SHA-256 session fingerprint and recovers the original payload '
-        'if the fingerprint is intact.'
+        'FUNCTION: Paste the intercepted encrypted artifact. Decoder verifies the '
+        'HMAC-SHA256 fingerprint with constant-time comparison, then decrypts '
+        'the AES-256-GCM payload if authentication succeeds.'
         '</div>',
         unsafe_allow_html=True,
     )
 
     intercepted = st.text_area(
-        "INTERCEPTED NETWORK FEED:",
-        height=110,
-        placeholder="Paste broadcast text from Module 2 here ...",
+        "INTERCEPTED ENCRYPTED ARTIFACT:",
+        height=190,
+        placeholder="Paste encrypted artifact JSON from Module 2 here ...",
     )
 
     col1, _ = st.columns([1, 3])
@@ -696,41 +714,47 @@ with tab3:
 
     if decode_btn:
         if not intercepted.strip():
-            st.markdown('<div class="alert-amber">⚠ No text to decrypt.</div>', unsafe_allow_html=True)
-        elif (
-            intercepted.strip() == st.session_state.network_text.strip()
-            and st.session_state.network_fingerprint_valid
-        ):
-            st.markdown(
-                '<div class="alert-green">'
-                '⬜ MISSION SUCCESS — FINGERPRINT VERIFIED — PAYLOAD RECOVERED'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            st.code(st.session_state.payload, language=None)
-            st.markdown(
-                f'<div style="color:#334433; font-family:\'Share Tech Mono\',monospace; font-size:0.74rem; margin-top:0.4rem;">'
-                f'VERIFIED FINGERPRINT: <span style="color:#b8860b;">{st.session_state.fingerprint}</span><br>'
-                f'HQ STATUS: Covert link established. SIF did not intercept this transmission.'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="alert-amber">⚠ No artifact to decrypt.</div>', unsafe_allow_html=True)
+        elif not _SHARED_SECRET:
+            st.markdown('<div class="alert-red">⚠ SIF_SHARED_SECRET NOT CONFIGURED — Cannot verify artifact.</div>', unsafe_allow_html=True)
         else:
-            garbage = "".join(random.choices(string.punctuation + "ÄÅÆÇÈÉÊËÌÍ█▓▒", k=52))
-            st.markdown(
-                '<div class="alert-red">'
-                '⬛ DECRYPTION FAILURE — FINGERPRINT MISMATCH — PAYLOAD IRRECOVERABLE'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-            st.code(garbage, language=None)
-            st.markdown(
-                '<div style="color:#334433; font-family:\'Share Tech Mono\',monospace; font-size:0.74rem; margin-top:0.4rem;">'
-                'ANALYSIS: SIF sanitisation destroyed the session fingerprint. '
-                'No payload recoverable from this transmission.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+            try:
+                artifact = parse_artifact(intercepted.strip())
+            except Exception:
+                artifact = None
+
+            verified, decoded = decode_secure_artifact(artifact, _SHARED_SECRET) if artifact else (False, None)
+            if verified and decoded:
+                st.markdown(
+                    '<div class="alert-green">'
+                    '⬜ MISSION SUCCESS — HMAC VERIFIED — AES-GCM PAYLOAD RECOVERED'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(decoded["payload"], language=None)
+                st.markdown(
+                    f'<div style="color:#334433; font-family:\'Share Tech Mono\',monospace; font-size:0.74rem; margin-top:0.4rem;">'
+                    f'VERIFIED FINGERPRINT: <span style="color:#b8860b;">{artifact["fingerprint"]}</span><br>'
+                    f'HQ STATUS: Artifact authenticated with constant-time HMAC comparison and decrypted with AES-256-GCM.'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                garbage = "".join(random.choices(string.punctuation + "ÄÅÆÇÈÉÊËÌÍ█▓▒", k=52))
+                st.markdown(
+                    '<div class="alert-red">'
+                    '⬛ DECRYPTION FAILURE — HMAC MISMATCH OR GCM AUTHENTICATION FAILURE — PAYLOAD IRRECOVERABLE'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(garbage, language=None)
+                st.markdown(
+                    '<div style="color:#334433; font-family:\'Share Tech Mono\',monospace; font-size:0.74rem; margin-top:0.4rem;">'
+                    'ANALYSIS: HMAC verification or AES-GCM authentication failed. '
+                    'No payload recoverable from this artifact.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
